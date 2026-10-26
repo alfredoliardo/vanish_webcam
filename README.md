@@ -12,7 +12,25 @@ If you like this project and want to support it, you can buy me a coffee through
 
 [Download VanishCam.exe]( https://nicoaauriemma.vercel.app/shop ) and double-click it to run the app. You do not need to install Python.
 
-The published EXE may predate the Particles and Goku modes. To use them now, run the local scripts or rebuild the EXE from these sources.
+The published EXE predates the Particles and Goku modes. To use them now, run the local scripts or rebuild the EXE from these sources.
+
+## macOS
+
+The app also runs on macOS (Apple Silicon and Intel, macOS 11 or later). Use the `.command` launchers instead of the `.bat` files:
+
+- `AVVIA_LOCALE.command` replaces `AVVIA_LOCALE.bat`
+- `AVVIA_VIRTUAL.command` replaces `AVVIA_VIRTUAL.bat`
+- `AVVIA_OBS.command` replaces `AVVIA_OBS.bat`
+- `BUILD_MACOS.command` builds `dist/VanishCam`, a single executable for the Mac architecture it is built on
+
+Double-click a launcher in Finder, or run it from Terminal, for example `./AVVIA_LOCALE.command --mode naruto`. The first run creates `.venv-local` with Python 3.12 or 3.11 if available (otherwise the default `python3`) and installs the dependencies. If Finder refuses to open the file, right-click it and choose **Open**, or run `chmod +x *.command` once.
+
+Notes for macOS:
+
+- **Camera permission:** the first time, macOS asks to allow camera access for Terminal (or the app that launched the script). If you denied it, enable it in **System Settings > Privacy & Security > Camera** and restart the launcher.
+- **Virtual camera:** install OBS Studio 30 or later, click **Start Virtual Camera** once in OBS to install its system extension, then stop it. After that, VanishCam can send its output to **OBS Virtual Camera**. Unity Capture is Windows-only.
+- **Audio:** sounds are played with the built-in `afplay` command, so pygame is not installed on macOS (its bundled SDL2 conflicts with OpenCV's).
+- **GPU:** on macOS MediaPipe runs the hand and face models on the GPU through Metal; no setup is required.
 
 ## Getting started
 
@@ -24,7 +42,7 @@ The published EXE may predate the Particles and Goku modes. To use them now, run
 
 **Particles:** Make the same V sign as in Normal Vanish. Your silhouette breaks into small colored fragments that drift sideways as if carried by the wind. The effect lasts about 2.1 seconds. It captures your silhouette once when the effect starts to keep the video smooth.
 
-**Goku:** Hold your index and middle fingers straight and together against your forehead for 1 second. Animated vertical comic-style lines run across your silhouette just before you teleport away and linger briefly afterward. To reappear, lower your hand, then repeat the gesture for another 1 second. The return uses the reverse effect. If you break the pose, the countdown starts over. `assets/teleport.MP3` plays on both disappearance and reappearance. The terminal shows the countdown for each gesture. The `V` and `R` keys are disabled in this mode: the gesture is the only way to disappear and reappear. No text is overlaid on the video.
+**Goku:** Hold your index and middle fingers straight and together against your forehead for 1 second. Animated vertical comic-style lines run across your silhouette just before you teleport away and linger briefly afterward. To reappear, lower your hand, then repeat the gesture for another 1 second. The return uses the reverse effect. If you break the pose, the countdown starts over. `assets/goku-teleport-sound.mp3` plays on both disappearance and reappearance. The terminal shows the countdown for each gesture. The `V` and `R` keys are disabled in this mode: the gesture is the only way to disappear and reappear. No text is overlaid on the video.
 
 **Naruto Vanish:** Bring your palms together in front of the webcam, with your fingers side by side rather than interlaced. Keep both hands visible. As soon as the gesture is recognized, you vanish in a cloud of smoke and a wooden log appears, falls, and remains visible until you press `R`. No microphone is needed. Naruto mode uses `hand_landmarker.task` to track both hands. `assets/vanish.MP3` plays through your computer speakers when the disappearance starts, including when triggered with `V`. You can trigger it again after pressing `R`.
 
@@ -64,6 +82,16 @@ You can change the camera, resolution, and maximum virtual-output FPS:
 ```powershell
 local_app\AVVIA_LOCALE.bat --camera 1 --width 1280 --height 720 --fps 30
 ```
+
+To use a picture instead of capturing the real background, pass `--background` with a JPG or PNG file:
+
+```powershell
+local_app\AVVIA_LOCALE.bat --mode goku --background C:\Images\beach.jpg
+```
+
+On macOS: `./AVVIA_VIRTUAL.command --mode goku --background ~/Pictures/beach.jpg`.
+
+The image is scaled to cover the video and cropped at the centre. You are cut out over it from the start, like a video-call virtual background, and when you vanish only the image remains. No calibration is needed, and `SPACE` does not capture a new background.
 
 To troubleshoot gesture recognition without adding text to the video, pass `--gesture-debug`. Diagnostic information appears only in the terminal.
 

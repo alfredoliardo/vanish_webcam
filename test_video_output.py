@@ -1,9 +1,12 @@
 import argparse
+import tempfile
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+import cv2
 import numpy as np
 
 from local_app import vanish_cam as app
@@ -120,6 +123,46 @@ class VideoLoopTests(unittest.TestCase):
 
     def test_all_devices_close_on_send_error(self):
         self.run_mock_video(send_error=RuntimeError("send failed"))
+
+
+class BackgroundImageTests(unittest.TestCase):
+    def test_image_covers_frame_and_keeps_the_centre(self):
+        image = np.zeros((100, 400, 3), np.uint8)
+        image[:, 150:250] = 255
+        fitted = app.fit_background(image, 60, 40)
+        self.assertEqual(fitted.shape, (40, 60, 3))
+        self.assertTrue((fitted[:, 30] == 255).all())
+        self.assertTrue((fitted[:, 0] == 0).all())
+
+    def test_fixed_background_skips_calibration(self):
+        capture = Mock()
+        frames = [np.full((24, 40, 3), 200, np.uint8) for _ in range(3)]
+        capture.read.side_effect = [(True, frame) for frame in frames]
+        mask = np.zeros((24, 40), np.float32)
+        mask[:, 20:] = 1.0
+        displayed = []
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as mocks:
+            path = Path(folder) / "sfondo.png"
+            cv2.imwrite(str(path), np.full((48, 80, 3), 50, np.uint8))
+            mocks.enter_context(patch.object(app, "parse_args", return_value=arguments(background=path)))
+            mocks.enter_context(patch.object(app, "download_models"))
+            mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
+            mocks.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), Mock())))
+            mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=None))
+            mocks.enter_context(patch.object(app, "person_mask", return_value=mask))
+            mocks.enter_context(patch.object(app, "recognize_gesture", return_value=("No_Hand", 0.0)))
+            mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=(0, 0, 0.1, 0.2, 0.3)))
+            mocks.enter_context(patch.object(app.cv2, "namedWindow"))
+            mocks.enter_context(patch.object(app.cv2, "resizeWindow"))
+            mocks.enter_context(patch.object(app.cv2, "destroyAllWindows"))
+            mocks.enter_context(patch.object(app.cv2, "imshow", side_effect=lambda name, frame: displayed.append(frame.copy())))
+            mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=(ord(" "), 0, ord("q"))))
+            mocks.enter_context(patch("builtins.print"))
+            self.assertEqual(app.run(), 0)
+        self.assertEqual(len(displayed), 3)
+        for shown in displayed:
+            self.assertTrue((shown[:, :20] == 50).all())  # Immagine di sfondo.
+            self.assertTrue((shown[:, 20:] == 200).all())  # Persona.
 
 
 if __name__ == "__main__":

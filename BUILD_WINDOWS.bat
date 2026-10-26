@@ -17,6 +17,7 @@ if errorlevel 1 (
 
 if not exist "models\gesture_recognizer.task" goto :models
 if not exist "models\selfie_segmenter_landscape.tflite" goto :models
+if not exist "models\blaze_face_short_range.tflite" goto :models
 goto :build
 
 :models

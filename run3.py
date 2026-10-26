@@ -1,3 +1,4 @@
+import sys
 import time
 from pathlib import Path
 
@@ -30,6 +31,10 @@ CAPTURE_WIDTH = 1280
 CAPTURE_HEIGHT = 720
 VIRTUAL_CAMERA_FPS = 30
 
+# Su macOS MediaPipe esegue i modelli di mani e volto solo su GPU (Metal): il
+# delegate CPU termina con "Service is unavailable" e la GPU vuole frame RGBA.
+USE_GPU_DELEGATE = sys.platform == "darwin"
+
 # Indici MediaPipe delle parti principali della mano.
 WRIST = 0
 PALM_INDICES = (0, 5, 9, 13, 17)
@@ -44,12 +49,20 @@ def load_meme(path):
 
 
 def open_camera(index=0):
-    """Apre la webcam provando i backend Windows e attende il primo frame."""
-    backends = (
-        ("DirectShow", cv2.CAP_DSHOW),
-        ("Media Foundation", cv2.CAP_MSMF),
-        ("automatico", cv2.CAP_ANY),
-    )
+    """Apre la webcam provando i backend del sistema e attende il primo frame."""
+    if sys.platform == "win32":
+        backends = (
+            ("DirectShow", cv2.CAP_DSHOW),
+            ("Media Foundation", cv2.CAP_MSMF),
+            ("automatico", cv2.CAP_ANY),
+        )
+    elif sys.platform == "darwin":
+        backends = (
+            ("AVFoundation", cv2.CAP_AVFOUNDATION),
+            ("automatico", cv2.CAP_ANY),
+        )
+    else:
+        backends = (("automatico", cv2.CAP_ANY),)
     attempts = []
 
     for backend_name, backend in backends:
@@ -64,7 +77,8 @@ def open_camera(index=0):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
 
-        for _ in range(30):
+        # AVFoundation impiega piu tempo a consegnare il primo frame.
+        for _ in range(100 if sys.platform == "darwin" else 30):
             ok, frame = cap.read()
             if ok and frame is not None and frame.size:
                 print(f"[WEBCAM] Backend attivo: {backend_name}")
@@ -78,7 +92,8 @@ def open_camera(index=0):
     raise RuntimeError(
         "Non riesco a ricevere immagini dalla webcam. "
         "Chiudi eventuali programmi che la stanno usando e controlla i permessi "
-        f"di Windows. Tentativi: {details}"
+        f"della videocamera di {'macOS' if sys.platform == 'darwin' else 'Windows'}. "
+        f"Tentativi: {details}"
     )
 
 
@@ -839,8 +854,11 @@ def main():
         "ok": load_meme(OK_MEME_PATH),
     }
 
+    delegate = mp_python.BaseOptions.Delegate.GPU if USE_GPU_DELEGATE else None
     face_options = mp_vision.FaceLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(FACE_MODEL_PATH)),
+        base_options=mp_python.BaseOptions(
+            model_asset_path=str(FACE_MODEL_PATH), delegate=delegate
+        ),
         running_mode=mp_vision.RunningMode.VIDEO,
         num_faces=1,
         min_face_detection_confidence=0.45,
@@ -848,7 +866,9 @@ def main():
         min_tracking_confidence=0.45,
     )
     hand_options = mp_vision.HandLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(HAND_MODEL_PATH)),
+        base_options=mp_python.BaseOptions(
+            model_asset_path=str(HAND_MODEL_PATH), delegate=delegate
+        ),
         running_mode=mp_vision.RunningMode.VIDEO,
         num_hands=2,
         min_hand_detection_confidence=0.45,
@@ -919,8 +939,12 @@ def main():
 
             frame = cv2.flip(frame, 1)
             frame = cv2.resize(frame, (CAMERA_WIDTH, CAMERA_HEIGHT))
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            if USE_GPU_DELEGATE:
+                rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGBA, data=rgba)
+            else:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             timestamp_ms = int((time.monotonic() - start_time) * 1000)
 
             face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)

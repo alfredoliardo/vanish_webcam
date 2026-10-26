@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import platform
+import ssl
 import sys
 import time
 import urllib.error
@@ -24,13 +26,23 @@ try:
         EFFECT_SECONDS, joined_hands_from_landmarks, landed_log_anchor,
         load_log, overlay_log, render_substitution, substitution_anchor,
     )
-    from .vanish_sound import SOUND_PATH, VanishSound
+    from .goku_effect import (
+        GOKU_EFFECT_SECONDS, GOKU_GRACE_SECONDS, GOKU_HOLD_SECONDS,
+        forehead_from_face, make_speed_lines, render_teleport, two_finger_salute,
+    )
+    from .particles_effect import PARTICLES_SECONDS, ParticleBurst
+    from .vanish_sound import SOUND_PATH, TELEPORT_SOUND_PATH, VanishSound
 except ImportError:
     from naruto_effect import (
         EFFECT_SECONDS, joined_hands_from_landmarks, landed_log_anchor,
         load_log, overlay_log, render_substitution, substitution_anchor,
     )
-    from vanish_sound import SOUND_PATH, VanishSound
+    from goku_effect import (
+        GOKU_EFFECT_SECONDS, GOKU_GRACE_SECONDS, GOKU_HOLD_SECONDS,
+        forehead_from_face, make_speed_lines, render_teleport, two_finger_salute,
+    )
+    from particles_effect import PARTICLES_SECONDS, ParticleBurst
+    from vanish_sound import SOUND_PATH, TELEPORT_SOUND_PATH, VanishSound
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -40,18 +52,40 @@ WINDOW_NAME = "Webcam - Anteprima"
 SEGMENTER_MODEL = MODEL_DIR / "selfie_segmenter_landscape.tflite"
 GESTURE_MODEL = MODEL_DIR / "gesture_recognizer.task"
 HAND_MODEL = APP_DIR / "hand_landmarker.task"
+FACE_MODEL = MODEL_DIR / "blaze_face_short_range.tflite"
 
+# Pinned versions and SHA-256 digests: a tampered or swapped download is rejected.
 MODEL_URLS = {
     SEGMENTER_MODEL: (
         "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
-        "selfie_segmenter_landscape/float16/latest/"
-        "selfie_segmenter_landscape.tflite"
+        "selfie_segmenter_landscape/float16/1/"
+        "selfie_segmenter_landscape.tflite",
+        "490e9ea734313e0de10fa0cd9e3c6133e36ea4db2b7a49bde9ef019f72796b8e",
     ),
     GESTURE_MODEL: (
         "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/"
-        "gesture_recognizer/float16/1/gesture_recognizer.task"
+        "gesture_recognizer/float16/1/gesture_recognizer.task",
+        "97952348cf6a6a4915c2ea1496b4b37ebabc50cbbf80571435643c455f2b0482",
+    ),
+    FACE_MODEL: (
+        "https://storage.googleapis.com/mediapipe-models/face_detector/"
+        "blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+        "b4578f35940bf5a1a655214a1cce5cab13eba73c1297cd78e1a04c2380b0152f",
     ),
 }
+MODES = ("normal", "naruto", "particles", "goku")
+MODELS_BY_MODE = {
+    "normal": (SEGMENTER_MODEL, GESTURE_MODEL),
+    "naruto": (SEGMENTER_MODEL,),
+    "particles": (SEGMENTER_MODEL, GESTURE_MODEL),
+    "goku": (SEGMENTER_MODEL, FACE_MODEL),
+}
+
+# MediaPipe's macOS wheel runs the hand graphs only on Metal: the CPU delegate
+# aborts with "Service is unavailable", and GPU input must be 4-channel RGBA.
+USE_GPU_DELEGATE = sys.platform == "darwin"
+MP_IMAGE_FORMAT = mp.ImageFormat.SRGBA if USE_GPU_DELEGATE else mp.ImageFormat.SRGB
+MP_COLOR_CONVERSION = cv2.COLOR_BGR2RGBA if USE_GPU_DELEGATE else cv2.COLOR_BGR2RGB
 
 CALIBRATION_SECONDS = 4.0
 BACKGROUND_SAMPLE_SECONDS = 0.55
@@ -66,6 +100,11 @@ class AppState:
     vanish_started: float | None = None
     last_gesture_check: float = 0.0
     fullscreen: bool = False
+    goku_hold_started: float | None = None
+    goku_last_seen: float = float("-inf")
+    # After each teleport the hand must leave the forehead before the next one.
+    goku_armed: bool = True
+    goku_countdown: float | None = None
 
 
 def positive_fps(value: str) -> float:
@@ -77,7 +116,7 @@ def positive_fps(value: str) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scegli Normal Vanish o Naruto Vanish per la webcam."
+        description="Scegli Normal Vanish, Naruto Vanish, Particles o Goku per la webcam."
     )
     parser.add_argument("--camera", type=int, default=0, help="Indice della webcam")
     parser.add_argument("--width", type=int, default=960, help="Larghezza video")
@@ -99,8 +138,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--virtual-device", help="Nome del dispositivo virtuale da usare")
     parser.add_argument(
-        "--mode", choices=("normal", "naruto"),
+        "--mode", choices=MODES,
         help="Salta il menu iniziale e avvia direttamente la modalità scelta",
+    )
+    parser.add_argument(
+        "--background", type=Path, metavar="IMMAGINE",
+        help="Sfondo fisso da file JPG/PNG: la persona appare sopra l'immagine e "
+             "non serve acquisire lo sfondo dalla webcam",
     )
     parser.add_argument(
         "--gesture-debug", action="store_true",
@@ -114,13 +158,15 @@ def choose_mode() -> str | None:
     """Simple keyboard/mouse menu shown before the clean camera feed."""
     title = "Scegli effetto"
     selected = [None]
-    window = np.zeros((420, 700, 3), dtype=np.uint8)
+    window = np.zeros((640, 700, 3), dtype=np.uint8)
     window[:] = (26, 29, 34)
     cv2.putText(window, "SCEGLI IL TUO VANISH", (68, 88),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.85, (236, 239, 242), 2, cv2.LINE_AA)
     buttons = (
-        ("normal", "1  NORMAL VANISH", "Segno a V  /  dissolvenza", 140),
-        ("naruto", "2  NARUTO VANISH", "Mani unite  /  tronco e fumo", 260),
+        ("normal", "1  NORMAL VANISH", "Segno a V  /  dissolvenza", 130),
+        ("naruto", "2  NARUTO VANISH", "Mani unite  /  tronco e fumo", 250),
+        ("particles", "3  PARTICLES", "Segno a V  /  frammenti nel vento", 370),
+        ("goku", "4  GOKU", "Due dita sulla fronte per 1 s  /  teletrasporto", 490),
     )
     for mode, heading, detail, top in buttons:
         cv2.rectangle(window, (65, top), (635, top + 94), (48, 54, 62), -1, cv2.LINE_AA)
@@ -142,10 +188,8 @@ def choose_mode() -> str | None:
         while selected[0] is None:
             cv2.imshow(title, window)
             key = cv2.waitKey(30) & 0xFF
-            if key == ord("1"):
-                selected[0] = "normal"
-            elif key == ord("2"):
-                selected[0] = "naruto"
+            if ord("1") <= key <= ord("4"):
+                selected[0] = MODES[key - ord("1")]
             elif key in (ord("q"), 27):
                 return None
             if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
@@ -167,13 +211,22 @@ def open_virtual_camera(args: argparse.Namespace, width: int, height: int):
             backend=args.virtual_backend, device=args.virtual_device,
         )
     except (ImportError, RuntimeError, OSError, ValueError) as error:
-        message = (
-            "Webcam virtuale non disponibile. Installa OBS Studio (con il driver "
-            "OBS Virtual Camera) oppure Unity Capture. Se usi OBS Virtual Camera, "
-            "ferma 'Avvia fotocamera virtuale' in OBS. "
-            "Avvia da AVVIA_LOCALE.bat per installare pyvirtualcam. "
-            f"Dettaglio: {error}"
-        )
+        if platform.system() == "Darwin":
+            message = (
+                "Webcam virtuale non disponibile. Installa OBS Studio 30 o successivo, "
+                "avvia una volta 'Avvia fotocamera virtuale' in OBS per installare "
+                "l'estensione di sistema, poi fermala. "
+                "Avvia da AVVIA_LOCALE.command per installare pyvirtualcam. "
+                f"Dettaglio: {error}"
+            )
+        else:
+            message = (
+                "Webcam virtuale non disponibile. Installa OBS Studio (con il driver "
+                "OBS Virtual Camera) oppure Unity Capture. Se usi OBS Virtual Camera, "
+                "ferma 'Avvia fotocamera virtuale' in OBS. "
+                "Avvia da AVVIA_LOCALE.bat per installare pyvirtualcam. "
+                f"Dettaglio: {error}"
+            )
         if args.virtual_camera is True or args.virtual_backend or args.virtual_device:
             raise RuntimeError(message) from error
         print(f"[Webcam] {message}\n[Webcam] Proseguo con l'anteprima locale.")
@@ -188,12 +241,31 @@ def send_virtual_frame(camera, frame: np.ndarray) -> None:
     camera.send(np.ascontiguousarray(frame))
 
 
-def download_models(mode: str = "normal") -> None:
+def ssl_context() -> ssl.SSLContext:
+    # Python from python.org on macOS ships without root certificates until
+    # "Install Certificates.command" runs: prefer certifi's bundle when present.
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_models(mode: str | None = None) -> None:
+    """Download the models for one mode, or all of them when mode is None."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    for destination, url in MODEL_URLS.items():
-        if mode == "naruto" and destination == GESTURE_MODEL:
+    for destination, (url, digest) in MODEL_URLS.items():
+        if mode is not None and destination not in MODELS_BY_MODE[mode]:
             continue
-        if destination.exists() and destination.stat().st_size > 100_000:
+        if destination.is_file() and file_sha256(destination) == digest:
             continue
 
         temporary = destination.with_suffix(destination.suffix + ".part")
@@ -202,7 +274,7 @@ def download_models(mode: str = "normal") -> None:
             request = urllib.request.Request(
                 url, headers={"User-Agent": "Vanish-Lab/1.0"}
             )
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=60, context=ssl_context()) as response:
                 total = int(response.headers.get("Content-Length", 0))
                 received = 0
                 with temporary.open("wb") as output:
@@ -213,6 +285,12 @@ def download_models(mode: str = "normal") -> None:
                             percent = int(received * 100 / total)
                             print(f"\r  {percent:3d}%", end="", flush=True)
             print()
+            if file_sha256(temporary) != digest:
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"{destination.name} scaricato non corrisponde al modello atteso "
+                    "(controllo SHA-256 fallito): file scartato."
+                )
             os.replace(temporary, destination)
         except (OSError, urllib.error.URLError) as error:
             temporary.unlink(missing_ok=True)
@@ -223,37 +301,92 @@ def download_models(mode: str = "normal") -> None:
 
 
 def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
-    if platform.system() == "Windows":
+    system = platform.system()
+    if system == "Windows":
         capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not capture.isOpened():
             capture.release()
             capture = cv2.VideoCapture(index)
+    elif system == "Darwin":
+        capture = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
     else:
         capture = cv2.VideoCapture(index)
 
     if not capture.isOpened():
+        hint = (
+            " Su macOS consenti l'accesso alla videocamera al Terminale in "
+            "Impostazioni di Sistema > Privacy e sicurezza > Videocamera."
+            if system == "Darwin" else ""
+        )
         raise RuntimeError(
-            f"Webcam {index} non disponibile. Chiudi le altre app oppure prova --camera 1."
+            f"Webcam {index} non disponibile. Chiudi le altre app oppure prova --camera 1.{hint}"
         )
 
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # AVFoundation returns empty frames while the camera (and the permission
+    # prompt) warms up: wait for the first real frame before starting.
+    deadline = time.perf_counter() + 5.0
+    while time.perf_counter() < deadline:
+        ok, frame = capture.read()
+        if ok and frame is not None and frame.size:
+            break
+        time.sleep(0.05)
     return capture
 
 
-def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiViewGestureRecognizer | MultiViewHandLandmarker]:
+def to_mp_image(frame: np.ndarray) -> mp.Image:
+    return mp.Image(image_format=MP_IMAGE_FORMAT, data=cv2.cvtColor(frame, MP_COLOR_CONVERSION))
+
+
+def detector_base_options(model: Path) -> python.BaseOptions:
+    delegate = python.BaseOptions.Delegate.GPU if USE_GPU_DELEGATE else None
+    return python.BaseOptions(model_asset_path=str(model), delegate=delegate)
+
+
+def create_goku_tasks(
+    segmenter_options: vision.ImageSegmenterOptions,
+) -> tuple[vision.ImageSegmenter, GokuPoseDetector]:
+    if not HAND_MODEL.is_file():
+        raise RuntimeError(f"Modello delle mani non trovato: {HAND_MODEL}")
+    hand_options = vision.HandLandmarkerOptions(
+        base_options=detector_base_options(HAND_MODEL),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.4,
+        min_hand_presence_confidence=0.4,
+        min_tracking_confidence=0.45,
+    )
+    face_options = vision.FaceDetectorOptions(
+        base_options=detector_base_options(FACE_MODEL),
+        running_mode=vision.RunningMode.VIDEO,
+        min_detection_confidence=0.5,
+    )
+    with ExitStack() as cleanup:
+        segmenter = vision.ImageSegmenter.create_from_options(segmenter_options)
+        cleanup.callback(segmenter.close)
+        hands = vision.HandLandmarker.create_from_options(hand_options)
+        cleanup.callback(hands.close)
+        face = vision.FaceDetector.create_from_options(face_options)
+        cleanup.pop_all()
+    return segmenter, GokuPoseDetector(hands, face)
+
+
+def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiViewGestureRecognizer | MultiViewHandLandmarker | GokuPoseDetector]:
     segmenter_options = vision.ImageSegmenterOptions(
         base_options=python.BaseOptions(model_asset_path=str(SEGMENTER_MODEL)),
         running_mode=vision.RunningMode.VIDEO,
         output_confidence_masks=True,
         output_category_mask=False,
     )
+    if mode == "goku":
+        return create_goku_tasks(segmenter_options)
     if mode == "naruto":
         if not HAND_MODEL.is_file():
             raise RuntimeError(f"Modello delle mani non trovato: {HAND_MODEL}")
         options = vision.HandLandmarkerOptions(
-            base_options=python.BaseOptions(model_asset_path=str(HAND_MODEL)),
+            base_options=detector_base_options(HAND_MODEL),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
             min_hand_detection_confidence=0.35,
@@ -268,7 +401,7 @@ def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiView
             category_allowlist=["Victory"],
         )
         options = vision.GestureRecognizerOptions(
-            base_options=python.BaseOptions(model_asset_path=str(GESTURE_MODEL)),
+            base_options=detector_base_options(GESTURE_MODEL),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
             min_hand_detection_confidence=0.35,
@@ -345,6 +478,38 @@ def alpha_composite(person: np.ndarray, background: np.ndarray, alpha: np.ndarra
         person.astype(np.float32) * alpha_3
         + background.astype(np.float32) * (1.0 - alpha_3)
     ).astype(np.uint8)
+
+
+def read_background_image(path: Path) -> np.ndarray:
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Immagine di sfondo non leggibile (usa JPG o PNG): {path}")
+    return image
+
+
+def fit_background(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Scale the image to cover the video frame and crop the centre."""
+    scale = max(width / image.shape[1], height / image.shape[0])
+    size = (max(width, round(image.shape[1] * scale)), max(height, round(image.shape[0] * scale)))
+    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    image = cv2.resize(image, size, interpolation=interpolation)
+    left, top = (size[0] - width) // 2, (size[1] - height) // 2
+    return np.ascontiguousarray(image[top:top + height, left:left + width])
+
+
+def person_over_background(
+    segmenter: vision.ImageSegmenter,
+    frame: np.ndarray,
+    background: np.ndarray,
+    image: mp.Image | None,
+    timestamp_ms: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cut the person out over a fixed --background image, like a virtual background."""
+    if image is None:
+        image = to_mp_image(frame)
+    height, width = frame.shape[:2]
+    mask = person_mask(segmenter, image, timestamp_ms, width, height)
+    return alpha_composite(frame, background, mask), mask
 
 
 def apply_dissolve(
@@ -515,7 +680,7 @@ class MultiViewGestureRecognizer:
                 selected.append(view)
         for crop, rotation in selected:
             rotated = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
+                image_format=image.image_format,
                 data=np.ascontiguousarray(np.rot90(crops[crop], rotation)),
             )
             result = self.alternate.recognize(rotated)
@@ -580,7 +745,7 @@ class MultiViewHandLandmarker:
                 selected.append(view)
         for crop, rotation in selected:
             rotated = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
+                image_format=image.image_format,
                 data=np.ascontiguousarray(np.rot90(views[crop], rotation)),
             )
             result = self.alternate.detect(rotated)
@@ -598,6 +763,81 @@ class MultiViewHandLandmarker:
             self.primary.close()
         finally:
             self.alternate.close()
+
+
+class GokuPoseDetector:
+    """Hand landmarks plus face detection for two fingers on the forehead."""
+
+    # The raised hand often covers part of the face: reuse the last forehead
+    # seen for a short while.
+    FACE_MEMORY_MS = 2000
+
+    def __init__(self, hands, face):
+        self.hands = hands
+        self.face = face
+        self.last_status = "nessuna mano"
+        self.forehead: tuple[np.ndarray, float] | None = None
+        self.forehead_ms = -self.FACE_MEMORY_MS
+
+    def detect_salute(self, image: mp.Image, timestamp_ms: int) -> bool:
+        result = self.hands.detect_for_video(image, timestamp_ms)
+        if not result.hand_landmarks:
+            self.last_status = "nessuna mano"
+            return False
+        # The face is only needed once a hand is in view.
+        faces = [face for face in self.face.detect_for_video(image, timestamp_ms).detections
+                 if len(face.keypoints) >= 4]
+        width, height = image.width, image.height
+        if faces:
+            face = max(faces, key=lambda item: item.bounding_box.width * item.bounding_box.height)
+            keypoints = np.array([(point.x * width, point.y * height)
+                                  for point in face.keypoints[:4]])
+            self.forehead = forehead_from_face(keypoints, float(face.bounding_box.width))
+            self.forehead_ms = timestamp_ms
+        elif self.forehead is None or timestamp_ms - self.forehead_ms > self.FACE_MEMORY_MS:
+            self.last_status = "mano visibile, volto non trovato"
+            return False
+        forehead, face_size = self.forehead
+        for hand in result.hand_landmarks:
+            points = np.array([(point.x * width, point.y * height) for point in hand])
+            if two_finger_salute(points, forehead, face_size):
+                self.last_status = "due dita sulla fronte"
+                return True
+        self.last_status = "mano e volto visibili, posa non completa"
+        return False
+
+    def close(self) -> None:
+        try:
+            self.hands.close()
+        finally:
+            self.face.close()
+
+
+def update_goku_hold(state: AppState, pose: bool, now: float) -> bool:
+    """Return True once the forehead pose has been held for GOKU_HOLD_SECONDS."""
+    if pose:
+        state.goku_last_seen = now
+    elif now - state.goku_last_seen > GOKU_GRACE_SECONDS:
+        if state.goku_hold_started is not None:
+            print("[Goku] Posizione interrotta: il conto alla rovescia riparte.")
+        state.goku_hold_started = None
+        state.goku_armed = True
+        return False
+    if not state.goku_armed or (not pose and state.goku_hold_started is None):
+        return False
+    if state.goku_hold_started is None:
+        state.goku_hold_started = now
+        state.goku_countdown = None
+    remaining = GOKU_HOLD_SECONDS - (now - state.goku_hold_started)
+    if remaining <= 0:
+        state.goku_hold_started = None
+        state.goku_armed = False
+        return True
+    countdown = float(np.ceil(remaining * 4) / 4)
+    if countdown != state.goku_countdown:
+        print(f"[Goku] Tieni la posizione: {countdown:.2f} s")
+        state.goku_countdown = countdown
+    return False
 
 
 def recognize_gesture(
@@ -634,13 +874,15 @@ def set_fullscreen(enabled: bool) -> None:
 
 def self_test() -> int:
     """Check bundled resources and model initialization without opening a webcam."""
-    required = (SEGMENTER_MODEL, GESTURE_MODEL, HAND_MODEL, SOUND_PATH)
+    required = (SEGMENTER_MODEL, GESTURE_MODEL, HAND_MODEL, FACE_MODEL, SOUND_PATH,
+                TELEPORT_SOUND_PATH)
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"Risorse mancanti: {', '.join(missing)}")
     load_log()
-    import pygame.mixer  # The distributed build must contain its MP3 decoder.
-    for mode in ("normal", "naruto"):
+    if sys.platform != "darwin":  # macOS plays the MP3 with afplay instead.
+        import pygame.mixer  # The distributed build must contain its MP3 decoder.
+    for mode in MODES:
         segmenter, recognizer = create_tasks(mode)
         try:
             recognizer.close()
@@ -662,6 +904,9 @@ def run() -> int:
 
 
 def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int:
+    background_path = getattr(args, "background", None)
+    # Read it before opening the webcam so a wrong path fails immediately.
+    custom_image = read_background_image(background_path) if background_path else None
     download_models(mode)
     capture = open_camera(args.camera, args.width, args.height)
     resources.callback(capture.release)
@@ -670,7 +915,12 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     resources.callback(segmenter.close)
     resources.callback(recognizer.close)
     log_sprite = load_log() if mode == "naruto" else None
-    vanish_sound = VanishSound() if mode == "naruto" else None
+    if mode == "naruto":
+        vanish_sound = VanishSound()
+    elif mode == "goku":
+        vanish_sound = VanishSound(TELEPORT_SOUND_PATH)
+    else:
+        vanish_sound = None
     if vanish_sound is not None:
         resources.callback(vanish_sound.close)
     resources.callback(cv2.destroyAllWindows)
@@ -692,13 +942,23 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     log_anchor: tuple[int, int, int] | None = None
     log_cache: dict[int, np.ndarray] = {}
     vanished_frame: np.ndarray | None = None
+    speed_lines: np.ndarray | None = None
+    particle_burst: ParticleBurst | None = None
     virtual_camera = None
     virtual_camera_initialized = False
     calibration_remaining = None
     last_gesture_report = 0.0
     started = time.perf_counter()
-    print("[Webcam] Esci dall'inquadratura per 4 secondi: acquisisco lo sfondo.")
-    print("[Webcam] Comandi nella finestra: SPAZIO nuovo sfondo, R riappari, V svanisci, F fullscreen, Q esci.")
+    if custom_image is None:
+        print("[Webcam] Esci dall'inquadratura per 4 secondi: acquisisco lo sfondo.")
+    else:
+        print(f"[Webcam] Sfondo fisso: {background_path.name}")
+    if mode == "goku":
+        print("[Webcam] Goku: indice e medio uniti sulla fronte per 1 secondo per sparire; "
+              "abbassa la mano e ripeti per riapparire.")
+        print("[Webcam] Comandi nella finestra: SPAZIO nuovo sfondo, F fullscreen, Q esci.")
+    else:
+        print("[Webcam] Comandi nella finestra: SPAZIO nuovo sfondo, R riappari, V svanisci, F fullscreen, Q esci.")
 
     try:
         while True:
@@ -715,6 +975,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 virtual_camera_initialized = True
                 if virtual_camera is not None:
                     resources.callback(virtual_camera.close)
+            if custom_image is not None and background is None:
+                background = fit_background(custom_image, width, height)
+                state.phase = "ready"
             if mode == "normal" and (dissolve_field is None or dissolve_field.shape != (height, width)):
                 dissolve_field, sparkle_noise = make_dissolve_fields(height, width)
             now = time.perf_counter()
@@ -746,6 +1009,50 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 state.calibration_started = now
                 display = camera_frame
 
+            elif mode == "goku":
+                if (
+                    state.phase in ("ready", "vanished")
+                    and now - state.last_gesture_check >= 0.08
+                ):
+                    state.last_gesture_check = now
+                    mp_image = to_mp_image(camera_frame)
+                    pose = recognizer.detect_salute(mp_image, elapsed_ms)
+                    if args.gesture_debug and now - last_gesture_report >= 1.0:
+                        print(f"[Goku] {recognizer.last_status}")
+                        last_gesture_report = now
+                    if update_goku_hold(state, pose, now):
+                        state.phase = "goku_out" if state.phase == "ready" else "goku_in"
+                        state.vanish_started = now
+                        last_mask = None
+                        last_mask_at = float("-inf")
+                        vanish_sound.play()
+                        print("[Goku] Teletrasporto!")
+                if state.phase in ("goku_out", "goku_in"):
+                    if speed_lines is None or speed_lines.shape[0] != max(12, width // 7):
+                        speed_lines = make_speed_lines(width)
+                    age = now - state.vanish_started
+                    appearing = state.phase == "goku_in"
+                    # Track the body while it is in view; freeze the last
+                    # silhouette once it has teleported away.
+                    if (appearing or age < GOKU_EFFECT_SECONDS * 0.45) and now - last_mask_at >= 0.05:
+                        if mp_image is None:
+                            mp_image = to_mp_image(camera_frame)
+                        last_mask = person_mask(segmenter, mp_image, elapsed_ms, width, height)
+                        last_mask_at = now
+                    display = render_teleport(camera_frame, background, last_mask, age,
+                                              speed_lines, appearing)
+                    if age >= GOKU_EFFECT_SECONDS:
+                        state.phase = "ready" if appearing else "vanished"
+                        last_mask = None
+                elif state.phase == "vanished":
+                    display = background
+                elif custom_image is not None:
+                    display, last_mask = person_over_background(
+                        segmenter, camera_frame, background, mp_image, elapsed_ms)
+                    last_mask_at = now
+                else:
+                    display = camera_frame
+
             elif state.phase == "vanished":
                 if vanished_frame is None:
                     vanished_frame = background.copy()
@@ -762,9 +1069,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     (0.08 if mode == "naruto" else GESTURE_INTERVAL_SECONDS)
                 ):
                     state.last_gesture_check = now
-                    rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                    if mode == "normal":
+                    mp_image = to_mp_image(camera_frame)
+                    if mode in ("normal", "particles"):
                         name, score = recognize_gesture(recognizer, mp_image, elapsed_ms)
                         if args.gesture_debug and now - last_gesture_report >= 1.0:
                             print(
@@ -773,7 +1079,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                                 f"rotazione={recognizer.preferred_rotation or 0}"
                             )
                             last_gesture_report = now
-                        start_vanish_on_gesture(state, name, score, now)
+                        if start_vanish_on_gesture(state, name, score, now) and mode == "particles":
+                            state.phase = "particles"
                     else:
                         joined = recognizer.recognize_joined_hands(mp_image, elapsed_ms)
                         if args.gesture_debug and now - last_gesture_report >= 1.0:
@@ -792,15 +1099,27 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     )
                     if needs_mask:
                         if mp_image is None:
-                            rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                            mp_image = to_mp_image(camera_frame)
                         mask = person_mask(segmenter, mp_image, elapsed_ms, width, height)
                         last_mask = mask
                         last_mask_at = now
                     if mode == "naruto" and log_anchor is None:
                         log_anchor = substitution_anchor(mask)
 
-                if mode == "naruto" and state.phase == "naruto_vanishing":
+                if state.phase == "particles":
+                    if particle_burst is None:
+                        # One segmentation at the start keeps the animation smooth.
+                        if mp_image is None:
+                            mp_image = to_mp_image(camera_frame)
+                        mask = person_mask(segmenter, mp_image, elapsed_ms, width, height)
+                        particle_burst = ParticleBurst(camera_frame, mask)
+                    age = now - state.vanish_started
+                    display = particle_burst.render(background, age)
+                    if age >= PARTICLES_SECONDS:
+                        state.phase = "vanished"
+                        vanished_frame = display
+                        particle_burst = None
+                elif mode == "naruto" and state.phase == "naruto_vanishing":
                     age = max(0.04, time.perf_counter() - state.vanish_started)
                     display = render_substitution(
                         camera_frame, background, mask, log_sprite, log_anchor, age, log_cache
@@ -808,6 +1127,10 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     if age >= EFFECT_SECONDS:
                         state.phase = "vanished"
                         vanished_frame = display
+                elif state.phase == "ready" and custom_image is not None:
+                    display, last_mask = person_over_background(
+                        segmenter, camera_frame, background, mp_image, elapsed_ms)
+                    last_mask_at = now
                 elif state.phase == "ready":
                     display = camera_frame
                 else:
@@ -831,7 +1154,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if key == ord(" "):
+            if key == ord(" ") and custom_image is not None:
+                print("[Webcam] Sfondo fisso da --background: SPAZIO non acquisisce un nuovo sfondo.")
+            elif key == ord(" "):
                 state.phase = "calibrating"
                 state.calibration_started = now
                 state.vanish_started = None
@@ -839,20 +1164,26 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 last_mask = None
                 last_mask_at = float("-inf")
                 vanished_frame = None
+                particle_burst = None
+                state.goku_hold_started = None
+                state.goku_armed = True
                 background_samples.clear()
                 calibration_remaining = None
                 print("[Webcam] Esci dall'inquadratura per 4 secondi: acquisisco il nuovo sfondo.")
-            elif key == ord("r"):
+            elif key == ord("r") and mode != "goku":
                 if background is not None:
                     state.phase = "ready"
                     state.vanish_started = None
                     vanished_frame = None
                     log_anchor = None
+                    particle_burst = None
                     last_mask = None
                     last_mask_at = float("-inf")
-            elif key == ord("v") and background is not None:
-                state.phase = "naruto_vanishing" if mode == "naruto" else "vanishing"
+            elif key == ord("v") and background is not None and mode != "goku":
+                state.phase = {"naruto": "naruto_vanishing",
+                               "particles": "particles"}.get(mode, "vanishing")
                 state.vanish_started = time.perf_counter()
+                particle_burst = None
                 if mode == "naruto":
                     vanish_sound.play()
                     log_anchor = None
